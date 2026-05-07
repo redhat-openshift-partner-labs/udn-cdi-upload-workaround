@@ -18,7 +18,7 @@ Instead of going through the CDI upload proxy, this tool:
 
 1. Detects whether the target namespace has a Primary UDN (via namespace labels + ClusterUserDefinedNetwork/UserDefinedNetwork CRs)
 2. Creates an ephemeral nginx pod and ClusterIP service inside the target namespace (on the UDN)
-3. Streams the local disk image to the nginx pod via `exec/tar` (tunneled through the API server, bypassing OVN)
+3. For each image: streams it to the nginx pod via `exec/tar` (tunneled through the API server, bypassing OVN), with progress reporting and SHA256 checksum verification (auto-retries up to 3 times on mismatch)
 4. Creates a DataVolume with an HTTP source pointing at the in-namespace nginx service
 5. The CDI importer pod fetches the image over the UDN (pod-to-pod on the same L2 segment)
 6. Cleans up the ephemeral pod and service
@@ -44,10 +44,10 @@ go build -o udn-image-uploader ./cmd
 ```bash
 ./udn-image-uploader \
   --namespace <namespace> \
-  --name <datavolume-name> \
-  --image-path <path-to-disk-image> \
-  [--size <pvc-size>] \
+  --image <name>:<path> \
+  [--image <name>:<path> ...] \
   [--storage-class <sc>] \
+  [--timeout <duration>] \
   [--kubeconfig <path>]
 ```
 
@@ -56,44 +56,60 @@ go build -o udn-image-uploader ./cmd
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--namespace` | Yes | | Target namespace for the golden image |
-| `--name` | Yes | | Name for the DataVolume and PVC |
-| `--image-path` | Yes | | Path to the local disk image file |
-| `--size` | No | Auto-detected | PVC size (e.g. `30Gi`). If omitted, calculated from image file size + 20% overhead |
+| `--image` | Yes | | Image to upload as `name:path` (repeatable for multiple images) |
 | `--storage-class` | No | cluster default | StorageClass for the PVC |
+| `--timeout` | No | `2h` | Upload timeout duration (e.g. `30m`, `3h`) |
 | `--kubeconfig` | No | `$KUBECONFIG` | Path to kubeconfig file |
+
+PVC size is auto-detected from each image file (file size + 20% overhead, rounded up to the nearest Gi).
 
 ### Example
 
 ```bash
-# UDN namespace -- uses the HTTP source workaround
+# Single image
 ./udn-image-uploader \
   --namespace green-namespace \
-  --name golden-image \
+  --image golden-image:./Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2 \
+  --storage-class gp3-csi
+
+# Multiple images in a single run
+./udn-image-uploader \
+  --namespace green-namespace \
+  --image fedora-43:./Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2 \
+  --image rhel-9:./rhel-9.5-x86_64-kvm.qcow2 \
   --storage-class gp3-csi \
-  --image-path ./Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+  --timeout 3h
 
 # Non-UDN namespace -- exits with guidance to use virtctl
 ./udn-image-uploader \
   --namespace standard-namespace \
-  --name golden-image \
-  --image-path ./Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+  --image golden-image:./Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
 ```
 
-### Example Output (UDN namespace)
+### Example Output
 
 ```
+Auto-detected PVC size for fedora-43: 1Gi
 Detected Primary UDN in namespace green-namespace, using HTTP source workflow
 Creating ephemeral image server pod...
 Creating image server service...
+
+[1/1] Uploading image "fedora-43" from ./Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+Computing local checksum for ./Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2...
+Local SHA256: a1b2c3d4...
 Streaming image ./Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2 to pod...
 Image size: 583335936 bytes (0.54 GB)
+[ 45.0%] 250 MB / 556 MB  (48.3 MB/s)
+[100.0%] 556 MB / 556 MB  (52.1 MB/s)
 Wrote 583335936 bytes to tar stream
+Verifying upload checksum...
+Checksum verified successfully
 Creating DataVolume with HTTP source...
 Waiting for DataVolume to complete...
 DataVolume phase: ImportScheduled
 DataVolume phase: ImportInProgress
 DataVolume phase: Succeeded
-Golden image golden-image created successfully
+Golden image fedora-43 created successfully
 Cleaning up ephemeral resources...
 Upload completed successfully!
 ```
@@ -109,7 +125,4 @@ Upload completed successfully!
 
 ## TODO
 
-- [ ] Support uploading multiple images in a single run
-- [ ] Add progress reporting during image stream to pod
 - [ ] Support resumable uploads for large images
-- [ ] Add `--timeout` flag (currently hardcoded to 2 hours)
