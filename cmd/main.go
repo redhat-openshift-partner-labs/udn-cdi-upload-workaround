@@ -5,55 +5,75 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/redhat-openshift-partner-labs/udn-cdi-local-upload-workaround"
+	goldenimage "github.com/redhat-openshift-partner-labs/udn-cdi-local-upload-workaround"
 )
 
+type imageList []goldenimage.ImageSpec
+
+func (l *imageList) String() string {
+	var parts []string
+	for _, img := range *l {
+		parts = append(parts, img.Name+":"+img.Path)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (l *imageList) Set(val string) error {
+	idx := strings.Index(val, ":")
+	if idx < 1 || idx == len(val)-1 {
+		return fmt.Errorf("invalid format %q, expected name:path", val)
+	}
+	*l = append(*l, goldenimage.ImageSpec{
+		Name: val[:idx],
+		Path: val[idx+1:],
+	})
+	return nil
+}
+
 func main() {
-	// Parse command line flags
 	kubeconfig := flag.String("kubeconfig", os.Getenv("KUBECONFIG"), "Path to kubeconfig file")
 	namespace := flag.String("namespace", "", "Target namespace for golden image")
-	pvcName := flag.String("name", "", "Name for the DataVolume/PVC")
-	pvcSize := flag.String("size", "", "Size of the PVC (auto-detected from image if not set)")
 	storageClass := flag.String("storage-class", "", "Storage class (optional)")
-	imagePath := flag.String("image-path", "", "Path to local disk image")
+	timeout := flag.Duration("timeout", 2*time.Hour, "Upload timeout duration (e.g. 30m, 3h)")
+
+	var images imageList
+	flag.Var(&images, "image", "Image to upload as name:path (repeatable)")
 
 	flag.Parse()
 
-	// Validate required flags
-	if *namespace == "" || *pvcName == "" || *imagePath == "" {
-		fmt.Println("Usage: golden-image-upload --namespace <ns> --name <name> --image-path <path>")
+	if *namespace == "" || len(images) == 0 {
+		fmt.Println("Usage: golden-image-upload --namespace <ns> --image <name>:<path> [--image <name>:<path> ...]")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	// Auto-detect PVC size from image if not specified
-	if *pvcSize == "" {
-		detectedSize, err := goldenimage.GetPVCSize(*imagePath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error detecting image size: %v\n", err)
-			os.Exit(1)
+	for i := range images {
+		if images[i].Size == "" {
+			detectedSize, err := goldenimage.GetPVCSize(images[i].Path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error detecting image size for %s: %v\n", images[i].Path, err)
+				os.Exit(1)
+			}
+			fmt.Printf("Auto-detected PVC size for %s: %s\n", images[i].Name, detectedSize)
+			images[i].Size = detectedSize
 		}
-		fmt.Printf("Auto-detected PVC size: %s\n", detectedSize)
-		*pvcSize = detectedSize
 	}
 
-	// Build rest config
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error building kubeconfig: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Create uploader
 	uploader, err := goldenimage.NewGoldenImageUploader(
 		config,
 		*namespace,
-		*pvcName,
-		*pvcSize,
+		images,
 		*storageClass,
 	)
 	if err != nil {
@@ -61,11 +81,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Run upload with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	if err := uploader.Upload(ctx, *imagePath); err != nil {
+	if err := uploader.Upload(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error uploading image: %v\n", err)
 		os.Exit(1)
 	}

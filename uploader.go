@@ -2,10 +2,14 @@ package goldenimage
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,6 +58,38 @@ var (
 	}
 )
 
+// progressReader wraps an io.Reader and prints transfer progress.
+type progressReader struct {
+	reader    io.Reader
+	total     int64
+	read      int64
+	lastPrint int64
+	start     time.Time
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	pr.read += int64(n)
+
+	if pr.read-pr.lastPrint >= 50*1024*1024 || err == io.EOF {
+		elapsed := time.Since(pr.start).Seconds()
+		speed := float64(pr.read) / (1024 * 1024) / elapsed
+		pct := float64(pr.read) / float64(pr.total) * 100
+		fmt.Printf("\r[%5.1f%%] %d MB / %d MB  (%.1f MB/s)",
+			pct, pr.read/(1024*1024), pr.total/(1024*1024), speed)
+		pr.lastPrint = pr.read
+	}
+
+	return n, err
+}
+
+// ImageSpec describes a single image to upload.
+type ImageSpec struct {
+	Name string
+	Path string
+	Size string
+}
+
 // GoldenImageUploader handles golden image uploads to namespaces,
 // automatically detecting and handling Primary UDN configurations.
 type GoldenImageUploader struct {
@@ -61,8 +97,7 @@ type GoldenImageUploader struct {
 	dynamicClient dynamic.Interface
 	restConfig    *rest.Config
 	namespace     string
-	pvcName       string
-	pvcSize       string
+	images        []ImageSpec
 	storageClass  string
 }
 
@@ -70,8 +105,7 @@ type GoldenImageUploader struct {
 func NewGoldenImageUploader(
 	restConfig *rest.Config,
 	namespace string,
-	pvcName string,
-	pvcSize string,
+	images []ImageSpec,
 	storageClass string,
 ) (*GoldenImageUploader, error) {
 	k8sClient, err := kubernetes.NewForConfig(restConfig)
@@ -89,21 +123,20 @@ func NewGoldenImageUploader(
 		dynamicClient: dynamicClient,
 		restConfig:    restConfig,
 		namespace:     namespace,
-		pvcName:       pvcName,
-		pvcSize:       pvcSize,
+		images:        images,
 		storageClass:  storageClass,
 	}, nil
 }
 
 // Upload handles the complete golden image upload workflow.
 // Automatically detects if namespace uses Primary UDN and selects appropriate method.
-func (u *GoldenImageUploader) Upload(ctx context.Context, localImagePath string) error {
-	// Validate local file exists
-	if _, err := os.Stat(localImagePath); err != nil {
-		return fmt.Errorf("local image not found: %w", err)
+func (u *GoldenImageUploader) Upload(ctx context.Context) error {
+	for _, img := range u.images {
+		if _, err := os.Stat(img.Path); err != nil {
+			return fmt.Errorf("local image not found: %s: %w", img.Path, err)
+		}
 	}
 
-	// Detect if namespace uses Primary UDN
 	hasUDN, err := u.namespaceHasPrimaryUDN(ctx)
 	if err != nil {
 		return fmt.Errorf("detecting UDN: %w", err)
@@ -111,11 +144,11 @@ func (u *GoldenImageUploader) Upload(ctx context.Context, localImagePath string)
 
 	if hasUDN {
 		fmt.Printf("Detected Primary UDN in namespace %s, using HTTP source workflow\n", u.namespace)
-		return u.uploadViaHTTPSource(ctx, localImagePath)
+		return u.uploadViaHTTPSource(ctx)
 	}
 
 	fmt.Printf("No Primary UDN detected in namespace %s, using standard upload flow\n", u.namespace)
-	return u.uploadViaProxy(ctx, localImagePath)
+	return u.uploadViaProxy(ctx)
 }
 
 // namespaceHasPrimaryUDN checks if the target namespace uses a Primary User-Defined Network.
@@ -272,46 +305,151 @@ func (u *GoldenImageUploader) selectorMatchesNamespace(spec map[string]interface
 }
 
 // uploadViaHTTPSource implements the HTTP source workflow for UDN namespaces.
-func (u *GoldenImageUploader) uploadViaHTTPSource(ctx context.Context, localImagePath string) error {
-	// Create ephemeral nginx pod
+func (u *GoldenImageUploader) uploadViaHTTPSource(ctx context.Context) error {
 	fmt.Println("Creating ephemeral image server pod...")
 	if err := u.createServerPod(ctx); err != nil {
 		return fmt.Errorf("creating server pod: %w", err)
 	}
 	defer u.cleanup(ctx)
 
-	// Create service
 	fmt.Println("Creating image server service...")
 	if err := u.createServerService(ctx); err != nil {
 		return fmt.Errorf("creating server service: %w", err)
 	}
 
-	// Stream image to pod
-	fmt.Printf("Streaming image %s to pod...\n", localImagePath)
-	if err := u.streamImageToPod(ctx, localImagePath); err != nil {
-		return fmt.Errorf("streaming image: %w", err)
+	for i, img := range u.images {
+		fmt.Printf("\n[%d/%d] Uploading image %q from %s\n", i+1, len(u.images), img.Name, img.Path)
+
+		if err := u.uploadSingleImage(ctx, img); err != nil {
+			return fmt.Errorf("uploading image %q: %w", img.Name, err)
+		}
+
+		fmt.Printf("Golden image %s created successfully\n", img.Name)
 	}
 
-	// Create DataVolume with HTTP source
+	return nil
+}
+
+// uploadSingleImage streams one image with verification, creates its DataVolume, and waits for completion.
+func (u *GoldenImageUploader) uploadSingleImage(ctx context.Context, img ImageSpec) error {
+	if err := u.streamImageWithRetry(ctx, img); err != nil {
+		return err
+	}
+
 	fmt.Println("Creating DataVolume with HTTP source...")
-	if err := u.createDataVolume(ctx); err != nil {
+	if err := u.createDataVolumeForImage(ctx, img); err != nil {
 		return fmt.Errorf("creating DataVolume: %w", err)
 	}
 
-	// Wait for completion
 	fmt.Println("Waiting for DataVolume to complete...")
-	if err := u.waitForDataVolume(ctx); err != nil {
+	if err := u.waitForDataVolume(ctx, img.Name); err != nil {
 		return fmt.Errorf("waiting for DataVolume: %w", err)
 	}
 
-	fmt.Printf("Golden image %s created successfully\n", u.pvcName)
 	return nil
 }
 
 // uploadViaProxy implements the standard CDI upload proxy workflow.
 // This is a placeholder - integrate with existing virtctl-style upload logic.
-func (u *GoldenImageUploader) uploadViaProxy(ctx context.Context, localImagePath string) error {
+func (u *GoldenImageUploader) uploadViaProxy(ctx context.Context) error {
 	return fmt.Errorf("namespace %s does not use a Primary UDN; this tool only handles UDN workaround uploads — use 'virtctl image-upload' instead", u.namespace)
+}
+
+func computeLocalChecksum(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (u *GoldenImageUploader) verifyImageOnPod(ctx context.Context, imageName string, expectedChecksum string) (bool, error) {
+	remotePath := "/usr/share/nginx/html/" + imageName
+
+	req := u.k8sClient.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(serverPodName).
+		Namespace(u.namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: "nginx",
+			Command:   []string{"sha256sum", remotePath},
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(u.restConfig, "POST", req.URL())
+	if err != nil {
+		return false, fmt.Errorf("creating executor: %w", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return false, fmt.Errorf("exec sha256sum: %w (stderr: %s)", err, stderr.String())
+	}
+
+	fields := strings.Fields(stdout.String())
+	if len(fields) == 0 {
+		return false, fmt.Errorf("unexpected sha256sum output: %s", stdout.String())
+	}
+
+	remoteChecksum := fields[0]
+	return remoteChecksum == expectedChecksum, nil
+}
+
+const maxUploadRetries = 3
+
+func (u *GoldenImageUploader) streamImageWithRetry(ctx context.Context, img ImageSpec) error {
+	imageName := img.Name + ".qcow2"
+
+	fmt.Printf("Computing local checksum for %s...\n", img.Path)
+	localChecksum, err := computeLocalChecksum(img.Path)
+	if err != nil {
+		return fmt.Errorf("computing checksum: %w", err)
+	}
+	fmt.Printf("Local SHA256: %s\n", localChecksum)
+
+	for attempt := 1; attempt <= maxUploadRetries; attempt++ {
+		if attempt > 1 {
+			fmt.Printf("Retry %d/%d for %s\n", attempt, maxUploadRetries, img.Name)
+		}
+
+		if err := u.streamImageToPod(ctx, img.Path, imageName); err != nil {
+			return fmt.Errorf("streaming image: %w", err)
+		}
+
+		fmt.Println("Verifying upload checksum...")
+		match, err := u.verifyImageOnPod(ctx, imageName, localChecksum)
+		if err != nil {
+			fmt.Printf("Warning: checksum verification failed: %v\n", err)
+			if attempt == maxUploadRetries {
+				return fmt.Errorf("checksum verification failed after %d attempts: %w", maxUploadRetries, err)
+			}
+			continue
+		}
+
+		if match {
+			fmt.Println("Checksum verified successfully")
+			return nil
+		}
+
+		fmt.Println("Checksum mismatch, image may be corrupted")
+		if attempt == maxUploadRetries {
+			return fmt.Errorf("checksum mismatch after %d attempts", maxUploadRetries)
+		}
+	}
+
+	return nil
 }
 
 // createServerPod creates an ephemeral nginx pod to serve the image.
@@ -392,7 +530,7 @@ func (u *GoldenImageUploader) createServerService(ctx context.Context) error {
 }
 
 // streamImageToPod streams the local image file to the nginx pod via exec/tar.
-func (u *GoldenImageUploader) streamImageToPod(ctx context.Context, localImagePath string) error {
+func (u *GoldenImageUploader) streamImageToPod(ctx context.Context, localImagePath string, imageName string) error {
 	// Open local file
 	file, err := os.Open(localImagePath)
 	if err != nil {
@@ -418,7 +556,7 @@ func (u *GoldenImageUploader) streamImageToPod(ctx context.Context, localImagePa
 		defer tw.Close()
 
 		header := &tar.Header{
-			Name: "disk.qcow2",
+			Name: imageName,
 			Mode: 0644,
 			Size: fileInfo.Size(),
 		}
@@ -427,12 +565,17 @@ func (u *GoldenImageUploader) streamImageToPod(ctx context.Context, localImagePa
 			return
 		}
 
-		written, err := io.Copy(tw, file)
+		pr := &progressReader{
+			reader: file,
+			total:  fileInfo.Size(),
+			start:  time.Now(),
+		}
+		written, err := io.Copy(tw, pr)
 		if err != nil {
 			errChan <- fmt.Errorf("copying file to tar: %w", err)
 			return
 		}
-		fmt.Printf("Wrote %d bytes to tar stream\n", written)
+		fmt.Printf("\nWrote %d bytes to tar stream\n", written)
 		errChan <- nil
 	}()
 
@@ -472,22 +615,20 @@ func (u *GoldenImageUploader) streamImageToPod(ctx context.Context, localImagePa
 	return nil
 }
 
-// createDataVolume creates a DataVolume with HTTP source pointing to the ephemeral server.
-// Uses dynamic client to avoid CDI typed client dependency issues.
-func (u *GoldenImageUploader) createDataVolume(ctx context.Context) error {
-	httpURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/disk.qcow2",
-		serverSvcName, u.namespace, serverPort)
+// createDataVolumeForImage creates a DataVolume with HTTP source pointing to the ephemeral server.
+func (u *GoldenImageUploader) createDataVolumeForImage(ctx context.Context, img ImageSpec) error {
+	httpURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/%s.qcow2",
+		serverSvcName, u.namespace, serverPort, img.Name)
 
-	// Build DataVolume as unstructured object
 	dv := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "cdi.kubevirt.io/v1beta1",
 			"kind":       "DataVolume",
 			"metadata": map[string]interface{}{
-				"name":      u.pvcName,
+				"name":      img.Name,
 				"namespace": u.namespace,
 				"annotations": map[string]interface{}{
-					"cdi.kubevirt.io/storage.bind.immediate.requested": "", // Force immediate binding
+					"cdi.kubevirt.io/storage.bind.immediate.requested": "",
 				},
 			},
 			"spec": map[string]interface{}{
@@ -499,7 +640,7 @@ func (u *GoldenImageUploader) createDataVolume(ctx context.Context) error {
 				"storage": map[string]interface{}{
 					"resources": map[string]interface{}{
 						"requests": map[string]interface{}{
-							"storage": u.pvcSize,
+							"storage": img.Size,
 						},
 					},
 				},
@@ -507,7 +648,6 @@ func (u *GoldenImageUploader) createDataVolume(ctx context.Context) error {
 		},
 	}
 
-	// Add storage class if specified
 	if u.storageClass != "" {
 		spec := dv.Object["spec"].(map[string]interface{})
 		storage := spec["storage"].(map[string]interface{})
@@ -523,13 +663,12 @@ func (u *GoldenImageUploader) createDataVolume(ctx context.Context) error {
 }
 
 // waitForDataVolume waits for the DataVolume to reach Succeeded phase.
-// Uses dynamic client to avoid CDI typed client dependency issues.
-func (u *GoldenImageUploader) waitForDataVolume(ctx context.Context) error {
+func (u *GoldenImageUploader) waitForDataVolume(ctx context.Context, dvName string) error {
 	var lastPhase string
 
 	return wait.PollUntilContextTimeout(ctx, 5*time.Second, 60*time.Minute, true,
 		func(ctx context.Context) (bool, error) {
-			dv, err := u.dynamicClient.Resource(dataVolumeGVR).Namespace(u.namespace).Get(ctx, u.pvcName, metav1.GetOptions{})
+			dv, err := u.dynamicClient.Resource(dataVolumeGVR).Namespace(u.namespace).Get(ctx, dvName, metav1.GetOptions{})
 			if err != nil {
 				return false, fmt.Errorf("getting DataVolume: %w", err)
 			}
